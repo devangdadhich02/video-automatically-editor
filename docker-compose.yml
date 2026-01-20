@@ -1,0 +1,13 @@
+services:
+  video-editor:
+    build: .
+    container_name: ai-video-editor
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+
