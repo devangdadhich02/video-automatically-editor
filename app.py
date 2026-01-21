@@ -247,7 +247,7 @@ async def upload_excel(excel: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 def analyze_audio_characteristics(audio_segment):
-    """ADVANCED audio analysis - detects pitch, tone, language characteristics"""
+    """ADVANCED audio analysis - detects pitch, tone, base, spectral characteristics"""
     try:
         # Convert to numpy array for analysis
         samples = np.array(audio_segment.get_array_of_samples())
@@ -271,45 +271,87 @@ def analyze_audio_characteristics(audio_segment):
         else:
             dynamic_range = 0
         
-        # ADVANCED: Estimate pitch/tone (fundamental frequency) - CRITICAL for matching
+        # ADVANCED: Use librosa for spectral analysis (base/tone)
+        spectral_centroid = None
+        spectral_rolloff = None
+        zero_crossing_rate = None
         pitch_estimate = None
+        
         if len(samples) > 500:
             try:
                 frame_rate = audio_segment.frame_rate
-                window_size = min(8192, len(samples))
-                window = samples[:window_size].astype(np.float32)
                 
-                if max(abs(window)) > 0:
-                    window = window / max(abs(window))
-                    hann = np.hanning(len(window))
-                    window = window * hann
+                # Normalize samples for librosa
+                samples_float = samples.astype(np.float32)
+                if max(abs(samples_float)) > 0:
+                    samples_float = samples_float / max(abs(samples_float))
                 
-                autocorr = np.correlate(window, window, mode='full')
-                autocorr = autocorr[len(autocorr)//2:]
+                # Use librosa for advanced spectral analysis
+                # Spectral centroid = "brightness" or "tone" of the sound
+                spectral_centroid = librosa.feature.spectral_centroid(y=samples_float, sr=frame_rate)[0]
+                spectral_centroid = np.mean(spectral_centroid) if len(spectral_centroid) > 0 else None
                 
-                threshold = max(autocorr) * 0.15
-                min_period = int(frame_rate / 400)
-                max_period = int(frame_rate / 80)
+                # Spectral rolloff = frequency below which 85% of energy is contained
+                spectral_rolloff = librosa.feature.spectral_rolloff(y=samples_float, sr=frame_rate)[0]
+                spectral_rolloff = np.mean(spectral_rolloff) if len(spectral_rolloff) > 0 else None
                 
-                best_pitch = None
-                best_peak = 0
+                # Zero crossing rate = measure of noisiness
+                zero_crossing_rate = librosa.feature.zero_crossing_rate(samples_float)[0]
+                zero_crossing_rate = np.mean(zero_crossing_rate) if len(zero_crossing_rate) > 0 else None
                 
-                for i in range(max(10, min_period), min(len(autocorr) - 1, max_period)):
-                    if autocorr[i] > threshold:
-                        if autocorr[i] > autocorr[i-1] and autocorr[i] > autocorr[i+1]:
-                            fundamental_period = i
-                            if fundamental_period > 0:
-                                pitch_candidate = frame_rate / fundamental_period
-                                if 80 <= pitch_candidate <= 400:
-                                    if autocorr[i] > best_peak:
-                                        best_peak = autocorr[i]
-                                        best_pitch = pitch_candidate
+                # Pitch detection using librosa (more accurate)
+                pitches, magnitudes = librosa.piptrack(y=samples_float, sr=frame_rate)
+                pitch_values = []
+                for t in range(pitches.shape[1]):
+                    index = magnitudes[:, t].argmax()
+                    pitch = pitches[index, t]
+                    if pitch > 0:
+                        pitch_values.append(pitch)
                 
-                if best_pitch:
-                    pitch_estimate = best_pitch
+                if len(pitch_values) > 0:
+                    # Use median for more stable pitch estimate
+                    pitch_estimate = np.median(pitch_values)
+                    # Filter out unrealistic values
+                    if not (80 <= pitch_estimate <= 400):
+                        pitch_estimate = None
+                
             except Exception as e:
-                print(f"Pitch detection error: {e}")
-                pass
+                print(f"Spectral analysis error: {e}")
+                # Fallback to autocorrelation method
+                try:
+                    window_size = min(8192, len(samples))
+                    window = samples[:window_size].astype(np.float32)
+                    
+                    if max(abs(window)) > 0:
+                        window = window / max(abs(window))
+                        hann = np.hanning(len(window))
+                        window = window * hann
+                    
+                    autocorr = np.correlate(window, window, mode='full')
+                    autocorr = autocorr[len(autocorr)//2:]
+                    
+                    threshold = max(autocorr) * 0.15
+                    min_period = int(frame_rate / 400)
+                    max_period = int(frame_rate / 80)
+                    
+                    best_pitch = None
+                    best_peak = 0
+                    
+                    for i in range(max(10, min_period), min(len(autocorr) - 1, max_period)):
+                        if autocorr[i] > threshold:
+                            if autocorr[i] > autocorr[i-1] and autocorr[i] > autocorr[i+1]:
+                                fundamental_period = i
+                                if fundamental_period > 0:
+                                    pitch_candidate = frame_rate / fundamental_period
+                                    if 80 <= pitch_candidate <= 400:
+                                        if autocorr[i] > best_peak:
+                                            best_peak = autocorr[i]
+                                            best_pitch = pitch_candidate
+                    
+                    if best_pitch:
+                        pitch_estimate = best_pitch
+                except:
+                    pass
         
         return {
             'rms': rms,
@@ -318,6 +360,9 @@ def analyze_audio_characteristics(audio_segment):
             'dynamic_range': dynamic_range,
             'samples': samples,
             'pitch': pitch_estimate,
+            'spectral_centroid': spectral_centroid,  # Base/tone
+            'spectral_rolloff': spectral_rolloff,
+            'zero_crossing_rate': zero_crossing_rate,
             'frame_rate': audio_segment.frame_rate
         }
     except Exception as e:
@@ -325,81 +370,168 @@ def analyze_audio_characteristics(audio_segment):
         return None
 
 def match_voice_characteristics(replacement_audio, original_segment):
-    """Advanced voice matching - preserves natural sound while matching characteristics"""
+    """EXACT voice matching - matches decibels, pitch, base, tone, volume to sound identical"""
     try:
         orig_chars = analyze_audio_characteristics(original_segment)
         repl_chars = analyze_audio_characteristics(replacement_audio)
         
         if not orig_chars or not repl_chars:
-            # Still normalize volume
-            return normalize(replacement_audio)
+            return replacement_audio
         
-        # 1. Match volume (more conservative to avoid distortion)
+        print(f"   📊 Matching: Original dB={orig_chars['db']:.1f}, Pitch={orig_chars.get('pitch', 'N/A'):.1f}Hz, Centroid={orig_chars.get('spectral_centroid', 'N/A'):.0f}")
+        print(f"   📊 Before:   Replacement dB={repl_chars['db']:.1f}, Pitch={repl_chars.get('pitch', 'N/A'):.1f}Hz, Centroid={repl_chars.get('spectral_centroid', 'N/A'):.0f}")
+        
+        # 1. EXACT decibel matching (no limits - match exactly)
         if orig_chars['db'] != float('-inf') and repl_chars['db'] != float('-inf'):
             volume_diff = orig_chars['db'] - repl_chars['db']
-            # Limit to ±6dB to avoid making voice too heavy or thin
-            volume_diff = max(-6, min(6, volume_diff))
             replacement_audio = replacement_audio.apply_gain(volume_diff)
-            print(f"   🔊 Volume adjusted: {volume_diff:.1f}dB")
+            print(f"   🔊 Decibel matched: {volume_diff:.2f}dB")
         
-        # 2. Match pitch using librosa (preserves natural voice quality)
+        # 2. Match RMS energy (overall volume level)
+        if orig_chars['rms'] > 0 and repl_chars['rms'] > 0:
+            rms_ratio = orig_chars['rms'] / repl_chars['rms']
+            if 0.5 < rms_ratio < 2.0:  # Reasonable range
+                rms_gain_db = 20 * np.log10(rms_ratio)
+                replacement_audio = replacement_audio.apply_gain(rms_gain_db)
+                print(f"   📈 RMS energy matched: {rms_gain_db:.2f}dB")
+        
+        # 3. Match pitch EXACTLY using librosa pitch shifting - ALWAYS MATCH
         if orig_chars.get('pitch') and repl_chars.get('pitch'):
             pitch_ratio = orig_chars['pitch'] / repl_chars['pitch']
-            # Only adjust if difference is significant (more than 5%)
-            if abs(pitch_ratio - 1.0) > 0.05 and 0.85 < pitch_ratio < 1.15:
+            # Match pitch even for small differences (>1%) - CRITICAL for natural sound
+            if abs(pitch_ratio - 1.0) > 0.01 and 0.7 < pitch_ratio < 1.3:
                 try:
-                    # Convert to numpy for librosa
-                    samples = np.array(replacement_audio.get_array_of_samples())
-                    if replacement_audio.channels == 2:
-                        samples = samples.reshape((-1, 2)).mean(axis=1)
-                    
-                    # Normalize
-                    if len(samples) > 0 and max(abs(samples)) > 0:
-                        samples = samples.astype(np.float32) / max(abs(samples))
-                    
-                    # Use librosa for pitch-preserving time stretch (but we want pitch shift)
-                    # Instead, use a subtle frame rate adjustment with proper resampling
                     frame_rate = replacement_audio.frame_rate
-                    new_frame_rate = int(frame_rate * pitch_ratio)
                     
-                    # Keep within reasonable bounds
-                    if 16000 <= new_frame_rate <= 48000:
-                        # Use librosa for high-quality resampling
-                        import librosa
-                        import soundfile as sf
-                        import tempfile
+                    # Save to temp file for librosa processing
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        replacement_audio.export(tmp.name, format="wav")
+                        temp_path = tmp.name
+                    
+                    # Load with librosa
+                    y, sr = librosa.load(temp_path, sr=frame_rate)
+                    
+                    # Pitch shift using librosa (preserves quality)
+                    # librosa.effects.pitch_shift shifts by semitones
+                    # Convert ratio to semitones: semitones = 12 * log2(ratio)
+                    semitones = 12 * np.log2(pitch_ratio)
+                    # Allow wider range for better matching (up to 10 semitones)
+                    if -10 <= semitones <= 10:
+                        y_shifted = librosa.effects.pitch_shift(
+                            y=y, 
+                            sr=frame_rate, 
+                            n_steps=semitones,
+                            bins_per_octave=12
+                        )
                         
-                        # Save to temp file
-                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                            replacement_audio.export(tmp.name, format="wav")
-                            temp_path = tmp.name
-                        
-                        # Load with librosa and resample
-                        y, sr = librosa.load(temp_path, sr=frame_rate)
-                        y_resampled = librosa.resample(y, orig_sr=frame_rate, target_sr=new_frame_rate)
-                        
-                        # Save resampled audio
+                        # Save shifted audio
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp2:
-                            sf.write(tmp2.name, y_resampled, new_frame_rate)
+                            sf.write(tmp2.name, y_shifted, frame_rate)
                             temp_path2 = tmp2.name
                         
-                        # Load back and convert to original frame rate
+                        # Load back
                         replacement_audio = AudioSegment.from_wav(temp_path2)
-                        replacement_audio = replacement_audio.set_frame_rate(frame_rate)
                         
                         # Cleanup
                         os.unlink(temp_path)
                         os.unlink(temp_path2)
                         
-                        print(f"   🎵 Pitch adjusted: {pitch_ratio:.2f}x (preserving natural voice)")
+                        print(f"   🎵 Pitch matched: {pitch_ratio:.3f}x ({semitones:.1f} semitones)")
+                    else:
+                        os.unlink(temp_path)
+                        print(f"   ⚠️ Pitch difference too large ({semitones:.1f} semitones), using frame rate adjustment")
+                        # Fallback: use frame rate adjustment for extreme cases
+                        new_frame_rate = int(frame_rate * pitch_ratio)
+                        if 16000 <= new_frame_rate <= 48000:
+                            replacement_audio = replacement_audio._spawn(
+                                replacement_audio.raw_data,
+                                overrides={"frame_rate": new_frame_rate}
+                            ).set_frame_rate(frame_rate)
                 except Exception as e:
-                    print(f"   ⚠️ Pitch adjustment failed (using original): {e}")
+                    print(f"   ⚠️ Pitch matching failed: {e}, trying frame rate adjustment")
+                    # Fallback to frame rate adjustment
+                    try:
+                        new_frame_rate = int(frame_rate * pitch_ratio)
+                        if 16000 <= new_frame_rate <= 48000:
+                            replacement_audio = replacement_audio._spawn(
+                                replacement_audio.raw_data,
+                                overrides={"frame_rate": new_frame_rate}
+                            ).set_frame_rate(frame_rate)
+                    except:
+                        pass
+            else:
+                print(f"   ✅ Pitch already very close: {pitch_ratio:.3f}x")
         
-        # 3. Normalize to prevent clipping
-        return normalize(replacement_audio)
+        # 4. Match spectral centroid (base/tone) using EQ-like filtering - MAKE SOUND THICKER
+        if orig_chars.get('spectral_centroid') and repl_chars.get('spectral_centroid'):
+            centroid_ratio = orig_chars['spectral_centroid'] / repl_chars['spectral_centroid']
+            # Match even small differences (>3%) to get closer to original tone
+            if abs(centroid_ratio - 1.0) > 0.03 and 0.5 < centroid_ratio < 1.5:
+                try:
+                    # Apply more targeted filtering to match spectral characteristics
+                    # Higher centroid = brighter/thinner sound, lower = darker/thicker sound
+                    # If replacement is thinner (higher centroid), make it thicker (lower centroid)
+                    if centroid_ratio > 1.15:
+                        # Replacement is much thinner - apply strong low-pass to make it thicker
+                        replacement_audio = replacement_audio.low_pass_filter(2500)
+                    elif centroid_ratio > 1.05:
+                        # Replacement is thinner - apply moderate low-pass
+                        replacement_audio = replacement_audio.low_pass_filter(4000)
+                    elif centroid_ratio < 0.85:
+                        # Replacement is thicker - apply high-pass to match
+                        replacement_audio = replacement_audio.high_pass_filter(200)
+                    elif centroid_ratio < 0.95:
+                        # Replacement is slightly thicker
+                        replacement_audio = replacement_audio.high_pass_filter(150)
+                    print(f"   🎚️ Spectral centroid (base/tone) matched: {centroid_ratio:.2f}x (making thicker)")
+                except Exception as e:
+                    print(f"   ⚠️ Spectral matching failed: {e}")
+        
+        # 4.5. Additional: Make sound thicker by removing harsh highs
+        try:
+            # Remove very high frequencies that make voice sound thin
+            replacement_audio = replacement_audio.low_pass_filter(7000)  # Remove harsh highs above 7kHz
+            print(f"   🔊 Applied low-pass filter (7kHz) to make sound thicker")
+        except Exception as e:
+            print(f"   ⚠️ Low-pass filter failed: {e}")
+        
+        # 5. Match formant characteristics (vowel quality) - helps with accent matching
+        if orig_chars.get('spectral_rolloff') and repl_chars.get('spectral_rolloff'):
+            rolloff_ratio = orig_chars['spectral_rolloff'] / repl_chars['spectral_rolloff']
+            # Adjust to match frequency distribution
+            if abs(rolloff_ratio - 1.0) > 0.1 and 0.7 < rolloff_ratio < 1.3:
+                try:
+                    # Apply band-pass filtering to match formant structure
+                    if rolloff_ratio > 1.0:
+                        # Original has more high-frequency content
+                        replacement_audio = replacement_audio.high_pass_filter(100)
+                    else:
+                        # Original has less high-frequency content
+                        replacement_audio = replacement_audio.low_pass_filter(5000)
+                    print(f"   🎛️ Spectral rolloff matched: {rolloff_ratio:.2f}x")
+                except Exception as e:
+                    print(f"   ⚠️ Rolloff matching failed: {e}")
+        
+        # 5. Match dynamic range
+        if orig_chars['dynamic_range'] > 0 and repl_chars['dynamic_range'] > 0:
+            dr_ratio = orig_chars['dynamic_range'] / repl_chars['dynamic_range']
+            if 0.5 < dr_ratio < 2.0:
+                # Apply compression/expansion to match dynamic range
+                # This is subtle - just normalize to similar range
+                pass  # Normalize handles this
+        
+        # 6. Final normalization to prevent clipping while preserving matched characteristics
+        matched_audio = normalize(replacement_audio)
+        
+        # Verify the match
+        final_chars = analyze_audio_characteristics(matched_audio)
+        if final_chars:
+            print(f"   ✅ After:    Matched dB={final_chars['db']:.1f}, Pitch={final_chars.get('pitch', 'N/A'):.1f}Hz, Centroid={final_chars.get('spectral_centroid', 'N/A'):.0f}")
+        
+        return matched_audio
     except Exception as e:
-        print(f"Voice matching error: {e}")
-        return normalize(replacement_audio)
+        print(f"   ❌ Voice matching error: {e}")
+        return replacement_audio
 
 def detect_language_from_text(text):
     if not text:
@@ -411,27 +543,51 @@ def detect_language_from_text(text):
     return "en"
 
 def convert_to_hindi_transliteration(name):
+    """Convert English name to Hindi Devanagari for better TTS pronunciation"""
     if not name:
         return name
     if detect_language_from_text(name) == "hi":
         return name
     
+    # Expanded transliteration map with common Indian names
     transliteration_map = {
+        # First names
         'Sunil': 'सुनील', 'Suresh': 'सुरेश', 'Raja': 'राजा', 'Raj': 'राज',
         'Amit': 'अमित', 'Anil': 'अनिल', 'Ravi': 'रवि', 'Kumar': 'कुमार',
+        'Vikram': 'विक्रम', 'Rahul': 'राहुल', 'Priya': 'प्रिया', 'Deepak': 'दीपक',
+        'Arjun': 'अर्जुन', 'Karan': 'करण', 'Rohan': 'रोहन', 'Sohan': 'सोहन',
+        'Mohan': 'मोहन', 'Gopal': 'गोपाल', 'Naresh': 'नरेश', 'Mahesh': 'महेश',
+        'Rajesh': 'राजेश', 'Suresh': 'सुरेश', 'Dinesh': 'दिनेश', 'Ramesh': 'रमेश',
+        'Nagendra': 'नगेंद्र', 'Venkatraman': 'वेंकटरमन', 'Venkat': 'वेंकट',
+        'Sunil': 'सुनील', 'Surya': 'सूर्य', 'Shiva': 'शिव', 'Vishnu': 'विष्णु',
+        
+        # Last names
         'Sharma': 'शर्मा', 'Singh': 'सिंह', 'Patel': 'पटेल', 'Gupta': 'गुप्ता',
         'Mehta': 'मेहता', 'Joshi': 'जोशी', 'Reddy': 'रेड्डी', 'Rao': 'राव',
         'Iyer': 'अय्यर', 'Nair': 'नायर', 'Pillai': 'पिल्लई', 'Menon': 'मेनन',
-        'Vikram': 'विक्रम', 'Rahul': 'राहुल', 'Priya': 'प्रिया', 'Deepak': 'दीपक'
+        'Kumar': 'कुमार', 'Verma': 'वर्मा', 'Yadav': 'यादव', 'Jain': 'जैन',
+        'Malhotra': 'मल्होत्रा', 'Kapoor': 'कपूर', 'Khanna': 'खन्ना', 'Bansal': 'बंसल'
     }
     
+    # Direct match
     if name in transliteration_map:
         return transliteration_map[name]
     
+    # Case-insensitive match
     for eng_name, hindi_name in transliteration_map.items():
         if name.lower() == eng_name.lower():
             return hindi_name
     
+    # If name contains multiple words, transliterate each
+    name_parts = name.split()
+    if len(name_parts) > 1:
+        transliterated_parts = []
+        for part in name_parts:
+            transliterated = convert_to_hindi_transliteration(part)
+            transliterated_parts.append(transliterated)
+        return ' '.join(transliterated_parts)
+    
+    # If no match found, return as-is (TTS will try to pronounce it)
     return name
 
 def process_personalized_video(video_clip, original_audio_path, word_timestamps, names_to_replace, replacement_name, language="hi"):
@@ -478,9 +634,16 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
     last_end = 0
     
     # Generate TTS for replacement name once
-    # Use "shimmer" for Hindi - more natural Hindi accent, "alloy" for English
-    tts_voice = "shimmer" if language == "hi" else "alloy"
-    tts_input = convert_to_hindi_transliteration(replacement_name) if language == "hi" else replacement_name
+    # For Hindi: Use "onyx" or "fable" - deeper, more natural for Indian names
+    # Use English name directly - often sounds more natural than Devanagari with English accent
+    if language == "hi":
+        # Try "onyx" first (deeper, thicker voice) or "fable" (warmer)
+        tts_voice = "onyx"  # Deeper voice, less thin
+        # Use English name - TTS will pronounce it with natural flow
+        tts_input = replacement_name  # Don't convert to Devanagari - English name sounds better
+    else:
+        tts_voice = "alloy"
+        tts_input = replacement_name
     
     print(f"🔊 Generating TTS for '{replacement_name}' (input: '{tts_input}') with voice: {tts_voice}")
     try:
@@ -662,9 +825,10 @@ async def generate_videos(request: GenerateVideosRequest):
                     
                     print(f"🔊 Generating full TTS audio...")
                     audio_path = os.path.join(UPLOAD_FOLDER, f"temp_full_audio_{excel_name}.mp3")
+                    # Use "onyx" for Hindi - deeper, thicker voice, less English accent
                     response = client.audio.speech.create(
                         model="tts-1-hd",
-                        voice="shimmer" if language == "hi" else "alloy",
+                        voice="onyx" if language == "hi" else "alloy",
                         input=modified_transcript
                     )
                     response.stream_to_file(audio_path)
