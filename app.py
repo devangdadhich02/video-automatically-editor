@@ -233,18 +233,41 @@ async def upload_excel(excel: UploadFile = File(...)):
         if filename.endswith('.csv'):
             df = pd.read_csv(filepath)
         else:
-            df = pd.read_excel(filepath)
+            # Try reading Excel file - may need openpyxl or xlrd
+            try:
+                df = pd.read_excel(filepath, engine='openpyxl')
+            except Exception as e1:
+                try:
+                    df = pd.read_excel(filepath, engine='xlrd')
+                except Exception as e2:
+                    print(f"Excel read error (openpyxl): {e1}")
+                    print(f"Excel read error (xlrd): {e2}")
+                    raise Exception(f"Could not read Excel file. Please ensure file is valid. Error: {str(e1)}")
+        
+        # Check if dataframe is empty
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Excel file is empty")
         
         # Get names from first column
         names = df.iloc[:, 0].dropna().astype(str).tolist()
         
+        if not names:
+            raise HTTPException(status_code=400, detail="No names found in the first column of Excel file")
+        
+        # Return names as-is (English) - they will be converted to Hindi during TTS generation
+        # This ensures matching works with transcript (which has English names)
         return {
             'success': True,
             'names': names,
             'count': len(names)
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Excel upload error: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"Error reading Excel file: {str(e)}")
 
 def analyze_audio_characteristics(audio_segment):
     """ADVANCED audio analysis - detects pitch, tone, base, spectral characteristics"""
@@ -353,6 +376,21 @@ def analyze_audio_characteristics(audio_segment):
                 except:
                     pass
         
+        # Detect gender based on pitch
+        # Male: ~85-180 Hz, Female: ~165-255 Hz
+        gender = None
+        if pitch_estimate:
+            if 85 <= pitch_estimate <= 180:
+                gender = "male"
+            elif 165 <= pitch_estimate <= 255:
+                gender = "female"
+            # Overlap zone: use spectral centroid as tiebreaker
+            elif 165 <= pitch_estimate <= 180:
+                if spectral_centroid and spectral_centroid < 2000:
+                    gender = "male"  # Lower centroid = male
+                else:
+                    gender = "female"
+        
         return {
             'rms': rms,
             'db': db,
@@ -360,6 +398,7 @@ def analyze_audio_characteristics(audio_segment):
             'dynamic_range': dynamic_range,
             'samples': samples,
             'pitch': pitch_estimate,
+            'gender': gender,  # Added gender detection
             'spectral_centroid': spectral_centroid,  # Base/tone
             'spectral_rolloff': spectral_rolloff,
             'zero_crossing_rate': zero_crossing_rate,
@@ -369,16 +408,130 @@ def analyze_audio_characteristics(audio_segment):
         print(f"Audio analysis error: {e}")
         return None
 
-def match_voice_characteristics(replacement_audio, original_segment):
-    """EXACT voice matching - matches decibels, pitch, base, tone, volume to sound identical"""
+def create_master_voice_profile(original_audio_path):
+    """
+    Create MASTER voice profile from entire original audio.
+    This profile is used for ALL name replacements to ensure consistency.
+    
+    Returns a fixed profile with:
+    - avg_pitch
+    - avg_spectral_envelope
+    - avg_low_mid_energy (150-400Hz)
+    - avg_formant_curve
+    - gender
+    - avg_speech_rate
+    """
     try:
-        orig_chars = analyze_audio_characteristics(original_segment)
+        print(f"🎯 Creating MASTER VOICE PROFILE from original audio...")
+        original_audio = AudioSegment.from_wav(original_audio_path)
+        
+        # Analyze entire audio (not just segments)
+        master_chars = analyze_audio_characteristics(original_audio)
+        
+        if not master_chars:
+            print(f"   ⚠️ Failed to create master profile, using defaults")
+            return None
+        
+        # Extract spectral envelope from entire audio
+        frame_rate = original_audio.frame_rate
+        samples = np.array(original_audio.get_array_of_samples())
+        if original_audio.channels == 2:
+            samples = samples.reshape((-1, 2)).mean(axis=1)
+        samples = samples.astype(np.float32)
+        if max(abs(samples)) > 0:
+            samples = samples / max(abs(samples))
+        
+        # Get average spectral envelope using STFT
+        n_fft = 2048
+        hop_length = 512
+        stft = librosa.stft(samples, n_fft=n_fft, hop_length=hop_length)
+        avg_spectral_envelope = np.mean(np.abs(stft), axis=1)  # Average across time
+        
+        # Calculate average low-mid energy (150-400 Hz)
+        freqs = librosa.fft_frequencies(sr=frame_rate, n_fft=n_fft)
+        low_mid_mask = (freqs >= 150) & (freqs <= 400)
+        avg_low_mid_energy = np.mean(avg_spectral_envelope[low_mid_mask])
+        
+        # Calculate average formant curve (500-1200 Hz)
+        formant_mask = (freqs >= 500) & (freqs <= 1200)
+        avg_formant_curve = np.mean(avg_spectral_envelope[formant_mask])
+        
+        # Estimate speech rate (syllables per second approximation)
+        # Use zero crossing rate as proxy
+        zcr = master_chars.get('zero_crossing_rate', 0.05)
+        # Rough estimate: higher ZCR = faster speech
+        avg_speech_rate = zcr * 10  # Normalized estimate
+        
+        master_profile = {
+            'avg_pitch': master_chars.get('pitch'),
+            'avg_spectral_envelope': avg_spectral_envelope,
+            'avg_low_mid_energy': avg_low_mid_energy,
+            'avg_formant_curve': avg_formant_curve,
+            'gender': master_chars.get('gender'),
+            'avg_speech_rate': avg_speech_rate,
+            'avg_db': master_chars.get('db'),
+            'avg_rms': master_chars.get('rms'),
+            'avg_spectral_centroid': master_chars.get('spectral_centroid'),
+            'avg_spectral_rolloff': master_chars.get('spectral_rolloff'),
+            'frame_rate': frame_rate,
+            'freqs': freqs
+        }
+        
+        print(f"   ✅ MASTER PROFILE created:")
+        print(f"      Pitch: {master_profile['avg_pitch']:.1f}Hz")
+        print(f"      Gender: {master_profile['gender']}")
+        print(f"      Low-Mid Energy: {master_profile['avg_low_mid_energy']:.4f}")
+        print(f"      Formant Curve: {master_profile['avg_formant_curve']:.4f}")
+        print(f"      Speech Rate: {master_profile['avg_speech_rate']:.2f}")
+        
+        return master_profile
+    except Exception as e:
+        print(f"   ❌ Master profile creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def match_voice_characteristics(replacement_audio, original_segment=None, master_profile=None):
+    """
+    EXACT voice matching using MASTER PROFILE for consistency.
+    
+    If master_profile is provided, uses FIXED profile for ALL replacements.
+    If not, falls back to per-segment analysis (legacy mode).
+    """
+    try:
+        # CRITICAL: Use master profile if available (ensures consistency)
+        if master_profile:
+            print(f"   🎯 Using MASTER VOICE PROFILE (consistent across all names)")
+            orig_chars = {
+                'pitch': master_profile['avg_pitch'],
+                'gender': master_profile['gender'],
+                'db': master_profile['avg_db'],
+                'rms': master_profile['avg_rms'],
+                'spectral_centroid': master_profile['avg_spectral_centroid'],
+                'spectral_rolloff': master_profile['avg_spectral_rolloff'],
+                'frame_rate': master_profile['frame_rate']
+            }
+        else:
+            # Legacy mode: analyze per-segment (can cause variation)
+            if original_segment:
+                orig_chars = analyze_audio_characteristics(original_segment)
+            else:
+                print(f"   ⚠️ No master profile or original segment, using replacement audio as-is")
+                return replacement_audio
+        
         repl_chars = analyze_audio_characteristics(replacement_audio)
         
         if not orig_chars or not repl_chars:
             return replacement_audio
         
-        print(f"   📊 Matching: Original dB={orig_chars['db']:.1f}, Pitch={orig_chars.get('pitch', 'N/A'):.1f}Hz, Centroid={orig_chars.get('spectral_centroid', 'N/A'):.0f}")
+        # Detect gender from original audio
+        orig_gender = orig_chars.get('gender')
+        orig_pitch = orig_chars.get('pitch')
+        
+        if master_profile:
+            print(f"   📊 Using MASTER PROFILE (FIXED): Pitch={orig_pitch:.1f}Hz, Gender={orig_gender or 'unknown'}, dB={orig_chars.get('db', 'N/A'):.1f}")
+        else:
+            print(f"   📊 Matching: Original dB={orig_chars.get('db', 'N/A'):.1f}, Pitch={orig_pitch:.1f}Hz, Gender={orig_gender or 'unknown'}, Centroid={orig_chars.get('spectral_centroid', 'N/A'):.0f}")
         print(f"   📊 Before:   Replacement dB={repl_chars['db']:.1f}, Pitch={repl_chars.get('pitch', 'N/A'):.1f}Hz, Centroid={repl_chars.get('spectral_centroid', 'N/A'):.0f}")
         
         # 1. EXACT decibel matching (no limits - match exactly)
@@ -395,11 +548,33 @@ def match_voice_characteristics(replacement_audio, original_segment):
                 replacement_audio = replacement_audio.apply_gain(rms_gain_db)
                 print(f"   📈 RMS energy matched: {rms_gain_db:.2f}dB")
         
-        # 3. Match pitch EXACTLY using librosa pitch shifting - ALWAYS MATCH
+        # 3. GENDER-AWARE pitch matching with formant processing
+        # CRITICAL: If original is MALE, force lower pitch + formant shift for male vocal tract
         if orig_chars.get('pitch') and repl_chars.get('pitch'):
             pitch_ratio = orig_chars['pitch'] / repl_chars['pitch']
+            
+            # If original is MALE, apply aggressive pitch lowering + formant shift
+            if orig_gender == "male":
+                # Force pitch down by -4 to -7 semitones for male voice
+                # Calculate base semitones from ratio
+                base_semitones = 12 * np.log2(pitch_ratio)
+                
+                # If TTS is too high (female/neutral), force it down more
+                if repl_chars.get('pitch', 0) > 180:  # TTS is likely female
+                    # Force -5 to -7 semitones down for male conversion
+                    target_semitones = -6.0  # Force male range
+                    print(f"   🎭 GENDER CONVERSION: Original is MALE ({orig_pitch:.1f}Hz), TTS is high ({repl_chars.get('pitch', 0):.1f}Hz)")
+                    print(f"   🎭 Forcing pitch down by {abs(target_semitones):.1f} semitones for male voice")
+                else:
+                    # Use calculated ratio but ensure it's in male range
+                    target_semitones = max(-7.0, min(-4.0, base_semitones))
+                    print(f"   🎭 MALE VOICE: Adjusting pitch by {target_semitones:.1f} semitones")
+            else:
+                # Female or unknown - use normal pitch matching
+                target_semitones = 12 * np.log2(pitch_ratio)
+            
             # Match pitch even for small differences (>1%) - CRITICAL for natural sound
-            if abs(pitch_ratio - 1.0) > 0.01 and 0.7 < pitch_ratio < 1.3:
+            if abs(target_semitones) > 0.1 and -10 <= target_semitones <= 10:
                 try:
                     frame_rate = replacement_audio.frame_rate
                     
@@ -413,16 +588,41 @@ def match_voice_characteristics(replacement_audio, original_segment):
                     
                     # Pitch shift using librosa (preserves quality)
                     # librosa.effects.pitch_shift shifts by semitones
-                    # Convert ratio to semitones: semitones = 12 * log2(ratio)
-                    semitones = 12 * np.log2(pitch_ratio)
-                    # Allow wider range for better matching (up to 10 semitones)
-                    if -10 <= semitones <= 10:
-                        y_shifted = librosa.effects.pitch_shift(
-                            y=y, 
-                            sr=frame_rate, 
-                            n_steps=semitones,
-                            bins_per_octave=12
-                        )
+                    y_shifted = librosa.effects.pitch_shift(
+                        y=y, 
+                        sr=frame_rate, 
+                        n_steps=target_semitones,
+                        bins_per_octave=12
+                    )
+                    
+                    # CRITICAL: If original is MALE, apply FORMANT SHIFT (male vocal tract simulation)
+                    if orig_gender == "male":
+                        # Formant shift: emphasize low frequencies (150-400 Hz) for male vocal tract
+                        # Use STFT to manipulate spectral envelope in low-mid range
+                        n_fft = 2048
+                        hop_length = 512
+                        stft = librosa.stft(y_shifted, n_fft=n_fft, hop_length=hop_length)
+                        magnitude = np.abs(stft)
+                        phase = np.angle(stft)
+                        
+                        # Get frequency bins
+                        freqs = librosa.fft_frequencies(sr=frame_rate, n_fft=n_fft)
+                        
+                        # Boost low-mid frequencies (150-400 Hz) for male formants
+                        # Reduce high frequencies (>2800 Hz) to remove female brightness
+                        for i, freq in enumerate(freqs):
+                            if 150 <= freq <= 400:
+                                # Boost male formant range by 1.5x
+                                magnitude[i, :] *= 1.5
+                            elif freq > 2800:
+                                # Reduce high frequencies for male timbre
+                                magnitude[i, :] *= 0.6
+                        
+                        # Reconstruct with modified magnitude
+                        stft_modified = magnitude * np.exp(1j * phase)
+                        y_shifted = librosa.istft(stft_modified, hop_length=hop_length)
+                        
+                        print(f"   🎭 Applied FORMANT SHIFT: Boosted 150-400Hz (male formants), Reduced >2800Hz")
                         
                         # Save shifted audio
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp2:
@@ -436,10 +636,76 @@ def match_voice_characteristics(replacement_audio, original_segment):
                         os.unlink(temp_path)
                         os.unlink(temp_path2)
                         
-                        print(f"   🎵 Pitch matched: {pitch_ratio:.3f}x ({semitones:.1f} semitones)")
+                        print(f"   🎵 Pitch matched: {pitch_ratio:.3f}x ({target_semitones:.1f} semitones)")
+                        
+                        # CRITICAL: If original is MALE, apply additional male voice processing
+                        if orig_gender == "male":
+                            # Stronger low-pass filtering for male timbre (≤2800 Hz)
+                            replacement_audio = replacement_audio.low_pass_filter(2800)
+                            replacement_audio = replacement_audio.low_pass_filter(3000)
+                            print(f"   🎭 Applied STRONG low-pass filters (≤2800Hz) for male timbre")
+                            
+                            # Low-mid boost (150-400 Hz) using EQ-like filtering
+                            # This simulates male vocal tract resonance
+                            try:
+                                # Convert to numpy for frequency-domain processing
+                                samples = np.array(replacement_audio.get_array_of_samples())
+                                if replacement_audio.channels == 2:
+                                    samples = samples.reshape((-1, 2)).mean(axis=1)
+                                samples = samples.astype(np.float32)
+                                if max(abs(samples)) > 0:
+                                    samples = samples / max(abs(samples))
+                                
+                                # Apply low-mid boost using STFT
+                                n_fft = 2048
+                                hop_length = 512
+                                stft = librosa.stft(samples, n_fft=n_fft, hop_length=hop_length)
+                                magnitude = np.abs(stft)
+                                phase = np.angle(stft)
+                                freqs = librosa.fft_frequencies(sr=frame_rate, n_fft=n_fft)
+                                
+                                # Boost 150-400 Hz range (male formants)
+                                # LOWER FORMANTS: Reduce 500-1200 Hz for adult male (not teenager)
+                                for i, freq in enumerate(freqs):
+                                    if 150 <= freq <= 400:
+                                        magnitude[i, :] *= 1.8  # Strong boost for male resonance
+                                    elif 500 <= freq <= 1200:
+                                        # Further lower formants for adult male
+                                        magnitude[i, :] *= 0.85  # 15% reduction
+                                
+                                # Reconstruct
+                                stft_boosted = magnitude * np.exp(1j * phase)
+                                y_boosted = librosa.istft(stft_boosted, hop_length=hop_length)
+                                
+                                # Normalize
+                                if max(abs(y_boosted)) > 0:
+                                    y_boosted = y_boosted / max(abs(y_boosted)) * 0.95
+                                
+                                # Save and load back
+                                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp3:
+                                    sf.write(tmp3.name, y_boosted, frame_rate)
+                                    temp_path3 = tmp3.name
+                                replacement_audio = AudioSegment.from_wav(temp_path3)
+                                os.unlink(temp_path3)
+                                
+                                print(f"   🎭 Applied LOW-MID BOOST (150-400Hz, 1.8x) for male vocal tract")
+                            except Exception as e:
+                                print(f"   ⚠️ Low-mid boost failed: {e}, using filtered audio")
+                            
+                            # Apply gentle compression/saturation for thickness
+                            # This adds warmth and body to male voice
+                            try:
+                                # Slight compression by limiting dynamic range
+                                replacement_audio = replacement_audio.normalize()
+                                # Apply gentle gain reduction for warmth
+                                replacement_audio = replacement_audio.apply_gain(-1.0)
+                                replacement_audio = replacement_audio.normalize()
+                                print(f"   🎭 Applied compression/saturation for male voice thickness")
+                            except:
+                                pass
                     else:
                         os.unlink(temp_path)
-                        print(f"   ⚠️ Pitch difference too large ({semitones:.1f} semitones), using frame rate adjustment")
+                        print(f"   ⚠️ Pitch difference too large ({target_semitones:.1f} semitones), using frame rate adjustment")
                         # Fallback: use frame rate adjustment for extreme cases
                         new_frame_rate = int(frame_rate * pitch_ratio)
                         if 16000 <= new_frame_rate <= 48000:
@@ -451,6 +717,7 @@ def match_voice_characteristics(replacement_audio, original_segment):
                     print(f"   ⚠️ Pitch matching failed: {e}, trying frame rate adjustment")
                     # Fallback to frame rate adjustment
                     try:
+                        frame_rate = replacement_audio.frame_rate
                         new_frame_rate = int(frame_rate * pitch_ratio)
                         if 16000 <= new_frame_rate <= 48000:
                             replacement_audio = replacement_audio._spawn(
@@ -462,52 +729,186 @@ def match_voice_characteristics(replacement_audio, original_segment):
             else:
                 print(f"   ✅ Pitch already very close: {pitch_ratio:.3f}x")
         
-        # 4. Match spectral centroid (base/tone) using EQ-like filtering - MAKE SOUND THICKER
+        # 4. Match spectral centroid (base/tone) using EQ-like filtering - MAKE SOUND MUCH THICKER
         if orig_chars.get('spectral_centroid') and repl_chars.get('spectral_centroid'):
             centroid_ratio = orig_chars['spectral_centroid'] / repl_chars['spectral_centroid']
-            # Match even small differences (>3%) to get closer to original tone
-            if abs(centroid_ratio - 1.0) > 0.03 and 0.5 < centroid_ratio < 1.5:
+            # Match even very small differences (>1%) to get closer to original tone
+            if abs(centroid_ratio - 1.0) > 0.01 and 0.4 < centroid_ratio < 1.6:
                 try:
-                    # Apply more targeted filtering to match spectral characteristics
+                    # Apply more aggressive filtering to match spectral characteristics
                     # Higher centroid = brighter/thinner sound, lower = darker/thicker sound
-                    # If replacement is thinner (higher centroid), make it thicker (lower centroid)
-                    if centroid_ratio > 1.15:
-                        # Replacement is much thinner - apply strong low-pass to make it thicker
-                        replacement_audio = replacement_audio.low_pass_filter(2500)
+                    # If replacement is thinner (higher centroid), make it MUCH thicker (lower centroid)
+                    if centroid_ratio > 1.2:
+                        # Replacement is much thinner - apply VERY strong low-pass (4x filters for maximum thickness)
+                        replacement_audio = replacement_audio.low_pass_filter(1800)  # Very aggressive
+                        replacement_audio = replacement_audio.low_pass_filter(2200)  # Strong filter
+                        replacement_audio = replacement_audio.low_pass_filter(2600)  # Additional thickness
+                        replacement_audio = replacement_audio.low_pass_filter(3000)  # Smooth it out
+                    elif centroid_ratio > 1.1:
+                        # Replacement is thinner - apply strong low-pass (3x filters)
+                        replacement_audio = replacement_audio.low_pass_filter(2000)  # Strong filter
+                        replacement_audio = replacement_audio.low_pass_filter(2500)  # Additional thickness
+                        replacement_audio = replacement_audio.low_pass_filter(3000)  # Smooth it out
                     elif centroid_ratio > 1.05:
-                        # Replacement is thinner - apply moderate low-pass
-                        replacement_audio = replacement_audio.low_pass_filter(4000)
-                    elif centroid_ratio < 0.85:
+                        # Replacement is slightly thinner - apply moderate low-pass (2x filters)
+                        replacement_audio = replacement_audio.low_pass_filter(2500)  # Moderate filter
+                        replacement_audio = replacement_audio.low_pass_filter(3500)  # Additional thickness
+                    elif centroid_ratio < 0.8:
                         # Replacement is thicker - apply high-pass to match
                         replacement_audio = replacement_audio.high_pass_filter(200)
-                    elif centroid_ratio < 0.95:
+                    elif centroid_ratio < 0.9:
                         # Replacement is slightly thicker
                         replacement_audio = replacement_audio.high_pass_filter(150)
-                    print(f"   🎚️ Spectral centroid (base/tone) matched: {centroid_ratio:.2f}x (making thicker)")
+                    print(f"   🎚️ Spectral centroid (base/tone) matched: {centroid_ratio:.2f}x (making MUCH thicker)")
                 except Exception as e:
                     print(f"   ⚠️ Spectral matching failed: {e}")
         
-        # 4.5. Additional: Make sound thicker by removing harsh highs
+        # 4.5. ADVANCED: Apply MASTER PROFILE spectral envelope for exact tone matching
+        # CRITICAL: Use master profile envelope for consistency across all names
         try:
-            # Remove very high frequencies that make voice sound thin
-            replacement_audio = replacement_audio.low_pass_filter(7000)  # Remove harsh highs above 7kHz
-            print(f"   🔊 Applied low-pass filter (7kHz) to make sound thicker")
+            frame_rate = replacement_audio.frame_rate
+            
+            # CRITICAL: Use master profile spectral envelope for consistency
+            if master_profile and master_profile.get('avg_spectral_envelope') is not None:
+                # Use FIXED master profile envelope (same for all names)
+                master_envelope = master_profile['avg_spectral_envelope']
+                master_freqs = master_profile['freqs']
+                print(f"   🎯 Using MASTER PROFILE spectral envelope (FIXED - consistent across all names)")
+                
+                # Get replacement audio STFT
+                repl_samples = np.array(replacement_audio.get_array_of_samples())
+                if replacement_audio.channels == 2:
+                    repl_samples = repl_samples.reshape((-1, 2)).mean(axis=1)
+                repl_samples = repl_samples.astype(np.float32)
+                if max(abs(repl_samples)) > 0:
+                    repl_samples = repl_samples / max(abs(repl_samples))
+                
+                n_fft = 2048
+                hop_length = 512
+                repl_stft = librosa.stft(repl_samples, n_fft=n_fft, hop_length=hop_length)
+                repl_mag = np.abs(repl_stft)
+                
+                # Use master envelope directly (expand to match replacement's time dimension)
+                # Master envelope is 1D (frequency bins), expand to match replacement's time frames
+                if len(master_envelope) == repl_mag.shape[0]:
+                    # Expand master envelope to match replacement's time dimension
+                    orig_mag = np.tile(master_envelope[:, np.newaxis], (1, repl_mag.shape[1]))
+                else:
+                    # Interpolate if sizes don't match (simple linear interpolation)
+                    new_freqs = librosa.fft_frequencies(sr=frame_rate, n_fft=n_fft)
+                    # Simple linear interpolation using numpy
+                    expanded_envelope = np.interp(new_freqs[:repl_mag.shape[0]], 
+                                                 master_freqs[:len(master_envelope)], 
+                                                 master_envelope)
+                    orig_mag = np.tile(expanded_envelope[:, np.newaxis], (1, repl_mag.shape[1]))
+            else:
+                # Fallback: use original segment (legacy mode - may cause variation)
+                if original_segment:
+                    orig_samples = np.array(original_segment.get_array_of_samples())
+                    if original_segment.channels == 2:
+                        orig_samples = orig_samples.reshape((-1, 2)).mean(axis=1)
+                    orig_samples = orig_samples.astype(np.float32)
+                    if max(abs(orig_samples)) > 0:
+                        orig_samples = orig_samples / max(abs(orig_samples))
+                    
+                    repl_samples = np.array(replacement_audio.get_array_of_samples())
+                    if replacement_audio.channels == 2:
+                        repl_samples = repl_samples.reshape((-1, 2)).mean(axis=1)
+                    repl_samples = repl_samples.astype(np.float32)
+                    if max(abs(repl_samples)) > 0:
+                        repl_samples = repl_samples / max(abs(repl_samples))
+                    
+                    # Resample if needed
+                    if original_segment.frame_rate != frame_rate:
+                        orig_samples = librosa.resample(orig_samples, orig_sr=original_segment.frame_rate, target_sr=frame_rate)
+                    
+                    n_fft = 2048
+                    hop_length = 512
+                    orig_stft = librosa.stft(orig_samples, n_fft=n_fft, hop_length=hop_length)
+                    repl_stft = librosa.stft(repl_samples, n_fft=n_fft, hop_length=hop_length)
+                    orig_mag = np.abs(orig_stft)
+                    repl_mag = np.abs(repl_stft)
+                else:
+                    # Skip if no master profile and no segment
+                    print(f"   ⚠️ No master profile or segment for envelope matching, skipping")
+                    raise Exception("No master profile or segment available")
+            
+            # Match the spectral envelope shape
+            # Use original's spectral shape but keep replacement's phase
+            if orig_mag.shape == repl_mag.shape:
+                # Normalize and apply original's spectral envelope
+                orig_mag_norm = orig_mag / (np.max(orig_mag) + 1e-10)
+                repl_mag_norm = repl_mag / (np.max(repl_mag) + 1e-10)
+                
+                # Blend: use 98% original envelope, 2% replacement (MAXIMUM THICKNESS - ALMOST IDENTICAL TO ORIGINAL)
+                blended_mag = 0.98 * orig_mag_norm + 0.02 * repl_mag_norm
+                
+                # Apply to replacement's phase
+                repl_phase = np.angle(repl_stft)
+                new_stft = blended_mag * np.exp(1j * repl_phase)
+                
+                # Convert back to time domain
+                y_matched = librosa.istft(new_stft, hop_length=hop_length)
+                
+                # Normalize
+                if max(abs(y_matched)) > 0:
+                    y_matched = y_matched / max(abs(y_matched)) * 0.95
+                
+                # Save and load back
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    sf.write(tmp.name, y_matched, frame_rate)
+                    temp_path = tmp.name
+                
+                replacement_audio = AudioSegment.from_wav(temp_path)
+                os.unlink(temp_path)
+                
+                # Apply additional low-pass filter to make even thicker after envelope transfer
+                try:
+                    # VERY aggressive low-pass filters for MAXIMUM thickness (4x filters)
+                    replacement_audio = replacement_audio.low_pass_filter(2000)  # Very strong filter
+                    replacement_audio = replacement_audio.low_pass_filter(2500)  # Strong filter for thickness
+                    replacement_audio = replacement_audio.low_pass_filter(3000)  # Additional thickness
+                    replacement_audio = replacement_audio.low_pass_filter(3500)  # Smooth it out
+                    
+                    # Add bass boost by applying high-pass at very low frequency (keeps bass, removes only sub-bass)
+                    # This enhances the low-mid frequencies that make voice sound thick
+                    replacement_audio = replacement_audio.high_pass_filter(50)  # Keep bass frequencies
+                    print(f"   🎚️ Applied original spectral envelope (98% blend - MAXIMUM THICKNESS) + 4x aggressive filters")
+                except:
+                    pass
         except Exception as e:
-            print(f"   ⚠️ Low-pass filter failed: {e}")
+            print(f"   ⚠️ Spectral envelope transfer failed: {e}, using filter fallback")
+            # Fallback: VERY aggressive low-pass to make MUCH thicker
+            try:
+                replacement_audio = replacement_audio.low_pass_filter(2000)  # Very strong filter
+                replacement_audio = replacement_audio.low_pass_filter(2500)  # Strong filter
+                replacement_audio = replacement_audio.low_pass_filter(3000)  # Additional thickness
+                replacement_audio = replacement_audio.low_pass_filter(3500)  # Smooth it out
+                # Keep bass frequencies for thickness
+                replacement_audio = replacement_audio.high_pass_filter(50)  # Preserve bass
+                print(f"   🔊 Applied VERY aggressive low-pass filters (4x) + bass boost to make sound MUCH thicker")
+            except:
+                pass
         
         # 5. Match formant characteristics (vowel quality) - helps with accent matching
         if orig_chars.get('spectral_rolloff') and repl_chars.get('spectral_rolloff'):
             rolloff_ratio = orig_chars['spectral_rolloff'] / repl_chars['spectral_rolloff']
-            # Adjust to match frequency distribution
-            if abs(rolloff_ratio - 1.0) > 0.1 and 0.7 < rolloff_ratio < 1.3:
+            # Adjust to match frequency distribution - more aggressive
+            if abs(rolloff_ratio - 1.0) > 0.05 and 0.6 < rolloff_ratio < 1.4:
                 try:
-                    # Apply band-pass filtering to match formant structure
-                    if rolloff_ratio > 1.0:
-                        # Original has more high-frequency content
-                        replacement_audio = replacement_audio.high_pass_filter(100)
-                    else:
-                        # Original has less high-frequency content
+                    # Apply more targeted filtering to match formant structure
+                    if rolloff_ratio > 1.1:
+                        # Original has much more high-frequency - apply stronger low-pass
+                        replacement_audio = replacement_audio.low_pass_filter(4000)
+                    elif rolloff_ratio > 1.0:
+                        # Original has more high-frequency
                         replacement_audio = replacement_audio.low_pass_filter(5000)
+                    elif rolloff_ratio < 0.9:
+                        # Original has less high-frequency - apply high-pass
+                        replacement_audio = replacement_audio.high_pass_filter(150)
+                    else:
+                        # Original has slightly less high-frequency
+                        replacement_audio = replacement_audio.high_pass_filter(100)
                     print(f"   🎛️ Spectral rolloff matched: {rolloff_ratio:.2f}x")
                 except Exception as e:
                     print(f"   ⚠️ Rolloff matching failed: {e}")
@@ -520,8 +921,27 @@ def match_voice_characteristics(replacement_audio, original_segment):
                 # This is subtle - just normalize to similar range
                 pass  # Normalize handles this
         
+        # 6. GENDER-AWARE bass boost and thickness enhancement
+        try:
+            if orig_gender == "male":
+                # For MALE voices: stronger low-pass + aggressive low-mid boost
+                matched_audio_before_norm = replacement_audio.low_pass_filter(2500)  # Very strong for male
+                matched_audio_before_norm = matched_audio_before_norm.low_pass_filter(2800)
+                matched_audio_before_norm = matched_audio_before_norm.low_pass_filter(3000)
+                # Stronger boost for male thickness
+                matched_audio_before_norm = matched_audio_before_norm.apply_gain(4.0)
+                print(f"   🎭 MALE VOICE: Applied aggressive bass boost (4.0dB) + 3x low-pass (≤2800Hz) for thick male voice")
+            else:
+                # For female/unknown: standard processing
+                matched_audio_before_norm = replacement_audio.low_pass_filter(3500)
+                matched_audio_before_norm = matched_audio_before_norm.low_pass_filter(4000)
+                matched_audio_before_norm = matched_audio_before_norm.apply_gain(3.5)
+                print(f"   🔊 Applied bass boost (3.5dB) + 2x low-pass filters for thickness")
+        except:
+            matched_audio_before_norm = replacement_audio
+        
         # 6. Final normalization to prevent clipping while preserving matched characteristics
-        matched_audio = normalize(replacement_audio)
+        matched_audio = normalize(matched_audio_before_norm)
         
         # Verify the match
         final_chars = analyze_audio_characteristics(matched_audio)
@@ -543,9 +963,18 @@ def detect_language_from_text(text):
     return "en"
 
 def convert_to_hindi_transliteration(name):
-    """Convert English name to Hindi Devanagari for better TTS pronunciation"""
+    """Convert English name to Hindi Devanagari for better TTS pronunciation
+    
+    CRITICAL: TTS will ONLY sound Hindi if input is Devanagari Unicode (U+0900-U+097F),
+    NOT Roman letters. This function MUST return Devanagari for Hindi accent.
+    """
     if not name:
         return name
+    
+    # Clean the name: strip whitespace and handle case
+    name = name.strip()
+    
+    # If already Devanagari, return as-is
     if detect_language_from_text(name) == "hi":
         return name
     
@@ -560,6 +989,7 @@ def convert_to_hindi_transliteration(name):
         'Rajesh': 'राजेश', 'Suresh': 'सुरेश', 'Dinesh': 'दिनेश', 'Ramesh': 'रमेश',
         'Nagendra': 'नगेंद्र', 'Venkatraman': 'वेंकटरमन', 'Venkat': 'वेंकट',
         'Sunil': 'सुनील', 'Surya': 'सूर्य', 'Shiva': 'शिव', 'Vishnu': 'विष्णु',
+        'Ray': 'रे', 'Rey': 'रे', 'Rai': 'राय',
         
         # Last names
         'Sharma': 'शर्मा', 'Singh': 'सिंह', 'Patel': 'पटेल', 'Gupta': 'गुप्ता',
@@ -569,13 +999,15 @@ def convert_to_hindi_transliteration(name):
         'Malhotra': 'मल्होत्रा', 'Kapoor': 'कपूर', 'Khanna': 'खन्ना', 'Bansal': 'बंसल'
     }
     
-    # Direct match
+    # Direct match (exact)
     if name in transliteration_map:
         return transliteration_map[name]
     
-    # Case-insensitive match
+    # Case-insensitive match (handles "suresh" -> "सुरेश")
+    name_lower = name.lower().strip()
     for eng_name, hindi_name in transliteration_map.items():
-        if name.lower() == eng_name.lower():
+        if name_lower == eng_name.lower():
+            print(f"      ✅ Found transliteration: '{name}' -> '{hindi_name}'")
             return hindi_name
     
     # If name contains multiple words, transliterate each
@@ -587,10 +1019,27 @@ def convert_to_hindi_transliteration(name):
             transliterated_parts.append(transliterated)
         return ' '.join(transliterated_parts)
     
-    # If no match found, return as-is (TTS will try to pronounce it)
-    return name
+    # If no match found, try phonetic transliteration
+    # Basic phonetic mapping for common sounds
+    phonetic_map = {
+        'a': 'अ', 'aa': 'आ', 'i': 'इ', 'ee': 'ई', 'u': 'उ', 'oo': 'ऊ',
+        'e': 'ए', 'ai': 'ऐ', 'o': 'ओ', 'au': 'औ',
+        'k': 'क', 'kh': 'ख', 'g': 'ग', 'gh': 'घ', 'ng': 'ङ',
+        'ch': 'च', 'chh': 'छ', 'j': 'ज', 'jh': 'झ', 'ny': 'ञ',
+        't': 'त', 'th': 'थ', 'd': 'द', 'dh': 'ध', 'n': 'न',
+        'p': 'प', 'ph': 'फ', 'b': 'ब', 'bh': 'भ', 'm': 'म',
+        'y': 'य', 'r': 'र', 'l': 'ल', 'v': 'व', 'w': 'व',
+        'sh': 'श', 'shh': 'ष', 's': 'स', 'h': 'ह'
+    }
+    
+    # If no match found in map, log warning and return as-is
+    # NOTE: This means TTS will receive English/Roman text and will sound English
+    print(f"      ⚠️ TRANSLITERATION WARNING: '{name}' not found in transliteration map!")
+    print(f"         TTS will receive English text and will sound English accent.")
+    print(f"         Please add '{name}' to transliteration_map for Hindi pronunciation.")
+    return name  # Return as-is - TTS will sound English if not Devanagari
 
-def process_personalized_video(video_clip, original_audio_path, word_timestamps, names_to_replace, replacement_name, language="hi"):
+def process_personalized_video(video_clip, original_audio_path, word_timestamps, names_to_replace, replacement_name, language="hi", master_profile=None):
     """
     SIMPLE & DIRECT: Replace audio segments and stretch video to match
     """
@@ -634,25 +1083,35 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
     last_end = 0
     
     # Generate TTS for replacement name once
-    # For Hindi: Use "onyx" or "fable" - deeper, more natural for Indian names
-    # Use English name directly - often sounds more natural than Devanagari with English accent
+    # CRITICAL: For Hindi, MUST use Devanagari for proper Hindi pronunciation (not English accent)
+    # TTS will ONLY sound Hindi if input is Devanagari Unicode, NOT Roman letters
     if language == "hi":
-        # Try "onyx" first (deeper, thicker voice) or "fable" (warmer)
-        tts_voice = "onyx"  # Deeper voice, less thin
-        # Use English name - TTS will pronounce it with natural flow
-        tts_input = replacement_name  # Don't convert to Devanagari - English name sounds better
+        tts_voice = "onyx"  # Deeper, thicker voice for Hindi - MUST use onyx for Hindi
+        # ALWAYS convert to Devanagari BEFORE TTS call
+        tts_input = convert_to_hindi_transliteration(replacement_name)
+        
+        # VERIFY: Check if result is actually Devanagari (Unicode range U+0900-U+097F)
+        is_devanagari = any('\u0900' <= char <= '\u097F' for char in tts_input) if tts_input else False
+        
+        print(f"   🔤 TRANSLITERATION CHECK:")
+        print(f"      Original name (Roman): '{replacement_name}'")
+        print(f"      TTS input (after transliteration): '{tts_input}'")
+        print(f"      Is Devanagari Unicode: {is_devanagari}")
+        if not is_devanagari:
+            print(f"      ⚠️ WARNING: TTS input is NOT Devanagari! Will sound English!")
     else:
         tts_voice = "alloy"
         tts_input = replacement_name
+        print(f"   🔤 TTS Input (English): '{tts_input}'")
     
-    print(f"🔊 Generating TTS for '{replacement_name}' (input: '{tts_input}') with voice: {tts_voice}")
+    print(f"🔊 Generating TTS - Voice: '{tts_voice}', Input: '{tts_input}'")
     try:
         client = get_openai_client()
         # Use tts-1-hd for better quality and more natural sound
         response = client.audio.speech.create(
             model="tts-1-hd",
-            voice=tts_voice,
-            input=tts_input
+            voice=tts_voice,  # MUST be "onyx" for Hindi
+            input=tts_input   # MUST be Devanagari Unicode for Hindi accent
         )
         
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
@@ -661,7 +1120,99 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
         
         replacement_audio_seg = AudioSegment.from_mp3(tts_audio_path)
         replacement_duration_ms = len(replacement_audio_seg)
-        print(f"✅ TTS generated: {replacement_duration_ms}ms")
+        
+        # VERIFY: Check if TTS audio is actually valid (not empty/silent)
+        if replacement_audio_seg.rms == 0 or replacement_duration_ms == 0:
+            print(f"   ❌ ERROR: TTS audio is EMPTY or SILENT! RMS={replacement_audio_seg.rms}, Duration={replacement_duration_ms}ms")
+            print(f"   ❌ TTS Input was: '{tts_input}'")
+            return None
+        
+        print(f"✅ TTS generated: {replacement_duration_ms}ms, RMS={replacement_audio_seg.rms:.1f}")
+        
+        # CRITICAL: Apply ADULT MALE voice processing BEFORE matching
+        # This ensures TTS sounds like adult (30-45 yrs), not child/teenager
+        try:
+            frame_rate = replacement_audio_seg.frame_rate
+            
+            # 1. SLOW DOWN SPEECH (Adult male pacing: 1.08x - 1.15x slower)
+            # Adult males speak slower than children - this is CRITICAL for adult sound
+            stretch_factor = 1.12  # 12% slower = adult male pacing
+            print(f"   🎤 Slowing down TTS speech by {stretch_factor:.2f}x for adult male pacing")
+            
+            # Convert to numpy for time stretching
+            samples = np.array(replacement_audio_seg.get_array_of_samples())
+            if replacement_audio_seg.channels == 2:
+                samples = samples.reshape((-1, 2)).mean(axis=1)
+            samples = samples.astype(np.float32)
+            if max(abs(samples)) > 0:
+                samples = samples / max(abs(samples))
+            
+            # Time stretch using librosa (preserves pitch)
+            y_stretched = librosa.effects.time_stretch(samples, rate=1.0/stretch_factor)
+            
+            # 2. ADD SUBHARMONIC CHEST RESONANCE (80-120 Hz)
+            # This simulates adult male chest vibration - CRITICAL for adult sound
+            print(f"   🎤 Adding subharmonic chest resonance (80-120 Hz)")
+            n_fft = 2048
+            hop_length = 512
+            stft = librosa.stft(y_stretched, n_fft=n_fft, hop_length=hop_length)
+            magnitude = np.abs(stft)
+            phase = np.angle(stft)
+            freqs = librosa.fft_frequencies(sr=frame_rate, n_fft=n_fft)
+            
+            # Synthesize subharmonic energy at 80-120 Hz (chest resonance)
+            for i, freq in enumerate(freqs):
+                if 80 <= freq <= 120:
+                    # Add 15% subharmonic energy (chest vibration)
+                    magnitude[i, :] *= 1.15
+                elif 500 <= freq <= 1200:
+                    # LOWER FORMANTS: Reduce 500-1200 Hz by 12% for adult male
+                    magnitude[i, :] *= 0.88
+                elif 150 <= freq <= 400:
+                    # Keep 150-400 Hz strong (already boosted)
+                    pass
+            
+            # Reconstruct with subharmonic and lowered formants
+            stft_processed = magnitude * np.exp(1j * phase)
+            y_processed = librosa.istft(stft_processed, hop_length=hop_length)
+            
+            # 3. ADD MICRO GRIT / WARMTH (subtle saturation)
+            # Remove "clean TTS" feel - add adult roughness
+            print(f"   🎤 Adding subtle saturation/warmth for adult voice character")
+            # Very light harmonic distortion (tanh saturation)
+            saturation_amount = 0.08  # Very subtle
+            y_processed = np.tanh(y_processed * (1 + saturation_amount)) / (1 + saturation_amount)
+            
+            # Normalize
+            max_val = max(abs(y_processed)) if len(y_processed) > 0 else 0
+            if max_val > 0:
+                y_processed = y_processed / max_val * 0.92  # Slight headroom
+            else:
+                print(f"   ⚠️ WARNING: Processed audio is silent after processing! Using original TTS")
+                raise Exception("Processed audio is silent")
+            
+            # VERIFY: Check if processed audio has any signal
+            if max(abs(y_processed)) == 0:
+                print(f"   ⚠️ WARNING: Processed audio is completely silent! Using original TTS")
+                raise Exception("Processed audio is silent")
+            
+            # Save processed audio
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_adult:
+                sf.write(tmp_adult.name, y_processed, frame_rate)
+                replacement_audio_seg = AudioSegment.from_wav(tmp_adult.name)
+                
+                # VERIFY: Check if saved audio is valid
+                if replacement_audio_seg.rms == 0 or len(replacement_audio_seg) == 0:
+                    print(f"   ⚠️ WARNING: Saved processed audio is silent! Using original TTS")
+                    os.unlink(tmp_adult.name)
+                    raise Exception("Saved processed audio is silent")
+                
+                os.unlink(tmp_adult.name)
+            
+            print(f"   ✅ Adult male processing complete: Slowed {stretch_factor:.2f}x + Chest resonance + Lowered formants + Saturation")
+            print(f"   ✅ Processed audio valid: RMS={replacement_audio_seg.rms:.1f}, Duration={len(replacement_audio_seg)}ms")
+        except Exception as e:
+            print(f"   ⚠️ Adult male processing failed: {e}, using original TTS")
         
     except Exception as e:
         print(f"❌ TTS generation failed: {e}")
@@ -681,17 +1232,54 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
         # Process the replacement
         print(f"🎬 Processing replacement at {start_time:.2f}s-{end_time:.2f}s")
         
-        # Get original audio segment for voice matching
-        original_seg_audio = original_audio[int(start_time*1000):int(end_time*1000)]
-        matched_audio = match_voice_characteristics(replacement_audio_seg, original_seg_audio)
+        # CRITICAL: Use MASTER PROFILE for consistent voice matching
+        # Do NOT analyze per-segment - use fixed master profile for all names
+        matched_audio = match_voice_characteristics(replacement_audio_seg, original_segment=None, master_profile=master_profile)
+        
+        # VERIFY: Check if matched audio is valid (not empty/silent)
+        if matched_audio is None or matched_audio.rms == 0 or len(matched_audio) == 0:
+            print(f"   ❌ ERROR: Matched audio is EMPTY or SILENT! RMS={matched_audio.rms if matched_audio else 'None'}, Duration={len(matched_audio) if matched_audio else 0}ms")
+            print(f"   ⚠️ Using original audio segment instead")
+            # Use original segment instead
+            name_video_seg = video_clip.subclip(start_time, end_time)
+            final_clips.append(name_video_seg)
+            last_end = end_time
+            continue
+        
+        print(f"   ✅ Matched audio valid: RMS={matched_audio.rms:.1f}, Duration={len(matched_audio)}ms")
         
         # Save matched audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
             matched_audio.export(temp_wav.name, format="wav")
             matched_audio_path = temp_wav.name
         
-        new_audio_clip = AudioFileClip(matched_audio_path)
-        tts_duration = new_audio_clip.duration
+        # VERIFY: Check if audio file was saved and is readable
+        if not os.path.exists(matched_audio_path) or os.path.getsize(matched_audio_path) == 0:
+            print(f"   ❌ ERROR: Audio file not saved or is empty! Path: {matched_audio_path}")
+            name_video_seg = video_clip.subclip(start_time, end_time)
+            final_clips.append(name_video_seg)
+            last_end = end_time
+            continue
+        
+        try:
+            new_audio_clip = AudioFileClip(matched_audio_path)
+            tts_duration = new_audio_clip.duration
+            
+            # VERIFY: Check if audio clip is valid
+            if tts_duration == 0 or new_audio_clip is None:
+                print(f"   ❌ ERROR: AudioFileClip is invalid! Duration={tts_duration}s")
+                name_video_seg = video_clip.subclip(start_time, end_time)
+                final_clips.append(name_video_seg)
+                last_end = end_time
+                continue
+            
+            print(f"   ✅ AudioFileClip valid: Duration={tts_duration:.2f}s")
+        except Exception as e:
+            print(f"   ❌ ERROR: Failed to load AudioFileClip: {e}")
+            name_video_seg = video_clip.subclip(start_time, end_time)
+            final_clips.append(name_video_seg)
+            last_end = end_time
+            continue
         
         # Get video segment
         name_video_seg = video_clip.subclip(start_time, end_time)
@@ -738,8 +1326,8 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
     if last_end < video_clip.duration:
         final_clips.append(video_clip.subclip(last_end, video_clip.duration))
         print(f"   📹 Added final segment: {last_end:.2f}s -> {video_clip.duration:.2f}s")
-    
-    # Cleanup
+                
+                # Cleanup
     if os.path.exists(tts_audio_path):
         os.unlink(tts_audio_path)
     
@@ -793,6 +1381,12 @@ async def generate_videos(request: GenerateVideosRequest):
         original_audio_path = os.path.join(UPLOAD_FOLDER, f"{video_filename}_original_audio.wav")
         original_video.audio.write_audiofile(original_audio_path, verbose=False, logger=None)
         
+        # CRITICAL: Create MASTER VOICE PROFILE once from entire original audio
+        # This ensures ALL name replacements sound like the SAME person (consistent voice)
+        master_voice_profile = create_master_voice_profile(original_audio_path)
+        if not master_voice_profile:
+            print(f"⚠️ WARNING: Master profile creation failed, using per-segment analysis (may cause variation)")
+        
         for excel_name in excel_names:
             print(f"🚀 Processing: {excel_name}")
             print(f"🔍 DEBUG: word_timestamps count: {len(word_timestamps) if word_timestamps else 0}")
@@ -809,7 +1403,8 @@ async def generate_videos(request: GenerateVideosRequest):
                     word_timestamps, 
                     names_to_replace, 
                     excel_name,
-                    language=language
+                    language=language,
+                    master_profile=master_voice_profile  # CRITICAL: Pass master profile for consistency
                 )
             
             # Fallback to full audio replacement if MAST failed
@@ -821,15 +1416,34 @@ async def generate_videos(request: GenerateVideosRequest):
                     if names_to_replace and len(names_to_replace) > 0:
                         # Replace all occurrences of the first name
                         for name in names_to_replace:
-                            modified_transcript = modified_transcript.replace(name, excel_name)
+                            # For Hindi: Convert to Devanagari for proper pronunciation
+                            if language == "hi":
+                                hindi_name = convert_to_hindi_transliteration(excel_name)
+                                modified_transcript = modified_transcript.replace(name, hindi_name)
+                                print(f"   🔤 Hindi transliteration in transcript: '{excel_name}' -> '{hindi_name}'")
+                            else:
+                                modified_transcript = modified_transcript.replace(name, excel_name)
                     
-                    print(f"🔊 Generating full TTS audio...")
+                    # CRITICAL: For Hindi, TTS input MUST be Devanagari Unicode
+                    tts_voice_fallback = "onyx" if language == "hi" else "alloy"
+                    
+                    # VERIFY: Check if transcript contains Devanagari (for Hindi)
+                    if language == "hi":
+                        has_devanagari = any('\u0900' <= char <= '\u097F' for char in modified_transcript)
+                        print(f"   🔤 FULL AUDIO TTS CHECK:")
+                        print(f"      Original Excel name: '{excel_name}'")
+                        print(f"      Modified transcript (first 100 chars): '{modified_transcript[:100]}...'")
+                        print(f"      Contains Devanagari Unicode: {has_devanagari}")
+                        if not has_devanagari:
+                            print(f"      ⚠️ WARNING: Transcript does NOT contain Devanagari! Will sound English!")
+                    
+                    print(f"🔊 Generating full TTS audio - Voice: '{tts_voice_fallback}'")
                     audio_path = os.path.join(UPLOAD_FOLDER, f"temp_full_audio_{excel_name}.mp3")
-                    # Use "onyx" for Hindi - deeper, thicker voice, less English accent
+                    # Use "onyx" for Hindi - deeper, thicker voice - MUST be onyx for Hindi
                     response = client.audio.speech.create(
                         model="tts-1-hd",
-                        voice="onyx" if language == "hi" else "alloy",
-                        input=modified_transcript
+                        voice=tts_voice_fallback,  # MUST be "onyx" for Hindi
+                        input=modified_transcript   # MUST contain Devanagari for Hindi accent
                     )
                     response.stream_to_file(audio_path)
                     new_audio = AudioFileClip(audio_path)
