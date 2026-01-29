@@ -36,7 +36,7 @@ docker build -t ai-video-editor .
 
 # Run the container
 docker run -d \
-  -p 8000:8000 \
+  -p 5508:5508 \
   -e OPENAI_API_KEY="your-api-key-here" \
   -v $(pwd)/uploads:/app/uploads \
   -v $(pwd)/outputs:/app/outputs \
@@ -75,7 +75,7 @@ export OPENAI_API_KEY="your-api-key-here"
 
 **Using uvicorn directly:**
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 5508 --reload
 ```
 
 **Or using the run script:**
@@ -83,11 +83,11 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 python run.py
 ```
 
-The server will start on `http://localhost:8000`
+The server will start on `http://localhost:5508`
 
 ### 4. Open in Browser
 
-Navigate to `http://localhost:8000` in your web browser.
+Navigate to `http://localhost:5508` in your web browser.
 
 ## How to Use
 

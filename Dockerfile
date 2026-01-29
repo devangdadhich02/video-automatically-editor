@@ -21,12 +21,12 @@ COPY . .
 RUN mkdir -p uploads outputs
 
 # Expose port
-EXPOSE 8000
+EXPOSE 5508
 
 # Set environment variable for OpenAI API key (should be set via .env or docker-compose)
 # DO NOT hardcode API keys here - use .env file instead
 ENV OPENAI_API_KEY=""
 
 # Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5508"]
 

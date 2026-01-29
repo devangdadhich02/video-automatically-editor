@@ -3,7 +3,7 @@ services:
     build: .
     container_name: ai-video-editor
     ports:
-      - "8000:8000"
+      - "5508:5508"
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:

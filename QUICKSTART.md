@@ -17,7 +17,7 @@ docker-compose up --build
 ```
 
 ### Step 3: Open Browser
-Navigate to: `http://localhost:8000`
+Navigate to: `http://localhost:5508`
 
 That's it! 🎉
 
@@ -49,14 +49,14 @@ export OPENAI_API_KEY="your-api-key-here"
 ### Step 3: Run Server
 ```bash
 # Option 1: Using uvicorn directly
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 5508 --reload
 
 # Option 2: Using run script
 python run.py
 ```
 
 ### Step 4: Open Browser
-Navigate to: `http://localhost:8000`
+Navigate to: `http://localhost:5508`
 
 ---
 
@@ -74,7 +74,7 @@ Navigate to: `http://localhost:8000`
 
 ### Docker Issues
 - Make sure Docker is running
-- Check if port 8000 is available
+- Check if port 5508 is available
 - View logs: `docker-compose logs -f`
 
 ### API Key Issues
