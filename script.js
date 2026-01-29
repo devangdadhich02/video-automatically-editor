@@ -268,7 +268,7 @@ async function generateVideos() {
                 names_to_replace: Object.keys(nameMapping), // List of original names to replace
                 excel_names: excelData.names,
                 word_timestamps: videoData.word_timestamps || [], // Include word timestamps for precise replacement
-                language: videoData.language || 'hi' // Include detected language for proper TTS (default Hindi)
+                language: 'hi' // FORCE HINDI - Always Hindi, no exceptions
             })
         });
         

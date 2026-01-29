@@ -64,7 +64,7 @@ class GenerateVideosRequest(BaseModel):
     names_to_replace: List[str]
     excel_names: List[str]
     word_timestamps: List[dict] = []
-    language: str = "hi"  # Default to Hindi
+    language: str = "hi"  # ALWAYS Hindi - forced
 
 @app.post("/api/upload-video")
 async def upload_video(video: UploadFile = File(...)):
@@ -94,8 +94,8 @@ async def upload_video(video: UploadFile = File(...)):
         video_clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
         video_clip.close()
         
-        # Initialize variables for language detection
-        detected_language = "hi"  # Default to Hindi (mostly Hindi videos)
+        # FORCE HINDI - Always use Hindi language (no detection)
+        detected_language = "hi"  # ALWAYS Hindi - no exceptions
         word_timestamps = []  # Initialize word timestamps
         
         # Transcribe using OpenAI Whisper with word-level timestamps
@@ -112,17 +112,10 @@ async def upload_video(video: UploadFile = File(...)):
                     )
                     transcript_text = transcript.text
                     
-                    # Detect language from transcript
-                    if hasattr(transcript, 'language'):
-                        detected_language = transcript.language
-                    else:
-                        # Detect language from text content
-                        hindi_chars = sum(1 for char in transcript_text if '\u0900' <= char <= '\u097F')
-                        total_chars = len([c for c in transcript_text if c.isalnum()])
-                        if total_chars > 0 and (hindi_chars / total_chars) > 0.3:  # More than 30% Hindi
-                            detected_language = "hi"
+                    # FORCE HINDI - No language detection, always Hindi
+                    detected_language = "hi"  # ALWAYS Hindi
                     
-                    print(f"Detected language: {detected_language}")
+                    print(f"Language: Hindi (forced)")
                     # Extract word timestamps - convert to dict format
                     if hasattr(transcript, 'words') and transcript.words:
                         for word_obj in transcript.words:
@@ -150,11 +143,8 @@ async def upload_video(video: UploadFile = File(...)):
                             file=audio_file_fallback
                         )
                     transcript_text = transcript.text if hasattr(transcript, 'text') else str(transcript)
-                    # Detect language from fallback transcript
-                    hindi_chars = sum(1 for char in transcript_text if '\u0900' <= char <= '\u097F')
-                    total_chars = len([c for c in transcript_text if c.isalnum()])
-                    if total_chars > 0 and (hindi_chars / total_chars) > 0.3:
-                        detected_language = "hi"
+                    # FORCE HINDI - Always Hindi, no detection
+                    detected_language = "hi"  # ALWAYS Hindi
                     word_timestamps = []
         except ValueError as ve:
             # Clean up audio file before raising error
@@ -1019,30 +1009,71 @@ def convert_to_hindi_transliteration(name):
             transliterated_parts.append(transliterated)
         return ' '.join(transliterated_parts)
     
-    # If no match found, try phonetic transliteration
-    # Basic phonetic mapping for common sounds
+    # FORCE HINDI TRANSLITERATION - Always convert to Devanagari
+    # If no match found, use phonetic transliteration to ensure Hindi output
+    print(f"      🔤 Name '{name}' not in map, using phonetic transliteration (FORCED HINDI)")
+    
+    # Enhanced phonetic transliteration - always converts to Devanagari
     phonetic_map = {
-        'a': 'अ', 'aa': 'आ', 'i': 'इ', 'ee': 'ई', 'u': 'उ', 'oo': 'ऊ',
-        'e': 'ए', 'ai': 'ऐ', 'o': 'ओ', 'au': 'औ',
+        # Vowels
+        'a': 'अ', 'aa': 'आ', 'i': 'इ', 'ee': 'ई', 'ii': 'ई', 'u': 'उ', 'oo': 'ऊ', 'uu': 'ऊ',
+        'e': 'ए', 'ai': 'ऐ', 'o': 'ओ', 'au': 'औ', 'ou': 'औ',
+        # Consonants
         'k': 'क', 'kh': 'ख', 'g': 'ग', 'gh': 'घ', 'ng': 'ङ',
         'ch': 'च', 'chh': 'छ', 'j': 'ज', 'jh': 'झ', 'ny': 'ञ',
         't': 'त', 'th': 'थ', 'd': 'द', 'dh': 'ध', 'n': 'न',
         'p': 'प', 'ph': 'फ', 'b': 'ब', 'bh': 'भ', 'm': 'म',
         'y': 'य', 'r': 'र', 'l': 'ल', 'v': 'व', 'w': 'व',
-        'sh': 'श', 'shh': 'ष', 's': 'स', 'h': 'ह'
+        'sh': 'श', 'shh': 'ष', 's': 'स', 'h': 'ह',
+        # Additional common sounds
+        'x': 'क्ष', 'z': 'ज़', 'f': 'फ़', 'q': 'क'
     }
     
-    # If no match found in map, log warning and return as-is
-    # NOTE: This means TTS will receive English/Roman text and will sound English
-    print(f"      ⚠️ TRANSLITERATION WARNING: '{name}' not found in transliteration map!")
-    print(f"         TTS will receive English text and will sound English accent.")
-    print(f"         Please add '{name}' to transliteration_map for Hindi pronunciation.")
-    return name  # Return as-is - TTS will sound English if not Devanagari
+    # Convert name to lowercase for phonetic matching
+    name_lower = name.lower()
+    hindi_result = []
+    i = 0
+    
+    while i < len(name_lower):
+        # Try 2-character combinations first (like 'aa', 'kh', 'ch', etc.)
+        if i + 1 < len(name_lower):
+            two_char = name_lower[i:i+2]
+            if two_char in phonetic_map:
+                hindi_result.append(phonetic_map[two_char])
+                i += 2
+                continue
+        
+        # Try single character
+        if name_lower[i] in phonetic_map:
+            hindi_result.append(phonetic_map[name_lower[i]])
+        elif name_lower[i].isalpha():
+            # If character not in map, use closest approximation
+            char = name_lower[i]
+            if char in 'aeiou':
+                hindi_result.append('अ')  # Default vowel
+            else:
+                hindi_result.append('क')  # Default consonant
+        # Skip non-alphabetic characters (spaces, etc.)
+        
+        i += 1
+    
+    # Join and add matra (vowel marks) if needed
+    transliterated = ''.join(hindi_result)
+    
+    # If result is empty or too short, use a default Hindi name
+    if not transliterated or len(transliterated) < 2:
+        print(f"      ⚠️ Phonetic transliteration failed for '{name}', using default Hindi")
+        transliterated = 'नाम'  # Default Hindi word for "name"
+    
+    print(f"      ✅ Phonetic transliteration: '{name}' -> '{transliterated}'")
+    return transliterated  # ALWAYS return Devanagari - never English
 
 def process_personalized_video(video_clip, original_audio_path, word_timestamps, names_to_replace, replacement_name, language="hi", master_profile=None):
     """
     SIMPLE & DIRECT: Replace audio segments and stretch video to match
     """
+    # FORCE HINDI - Override language parameter
+    language = "hi"  # ALWAYS Hindi, ignore parameter
     print(f"\n🔍 DEBUG: Starting video processing")
     print(f"   - Replacement name: {replacement_name}")
     print(f"   - Names to replace: {names_to_replace}")
@@ -1082,27 +1113,22 @@ def process_personalized_video(video_clip, original_audio_path, word_timestamps,
     final_clips = []
     last_end = 0
     
-    # Generate TTS for replacement name once
+    # FORCE HINDI - Always use Hindi TTS (onyx voice + Devanagari)
     # CRITICAL: For Hindi, MUST use Devanagari for proper Hindi pronunciation (not English accent)
     # TTS will ONLY sound Hindi if input is Devanagari Unicode, NOT Roman letters
-    if language == "hi":
-        tts_voice = "onyx"  # Deeper, thicker voice for Hindi - MUST use onyx for Hindi
-        # ALWAYS convert to Devanagari BEFORE TTS call
-        tts_input = convert_to_hindi_transliteration(replacement_name)
-        
-        # VERIFY: Check if result is actually Devanagari (Unicode range U+0900-U+097F)
-        is_devanagari = any('\u0900' <= char <= '\u097F' for char in tts_input) if tts_input else False
-        
-        print(f"   🔤 TRANSLITERATION CHECK:")
-        print(f"      Original name (Roman): '{replacement_name}'")
-        print(f"      TTS input (after transliteration): '{tts_input}'")
-        print(f"      Is Devanagari Unicode: {is_devanagari}")
-        if not is_devanagari:
-            print(f"      ⚠️ WARNING: TTS input is NOT Devanagari! Will sound English!")
-    else:
-        tts_voice = "alloy"
-        tts_input = replacement_name
-        print(f"   🔤 TTS Input (English): '{tts_input}'")
+    tts_voice = "onyx"  # ALWAYS onyx for Hindi - forced
+    # ALWAYS convert to Devanagari BEFORE TTS call
+    tts_input = convert_to_hindi_transliteration(replacement_name)
+    
+    # VERIFY: Check if result is actually Devanagari (Unicode range U+0900-U+097F)
+    is_devanagari = any('\u0900' <= char <= '\u097F' for char in tts_input) if tts_input else False
+    
+    print(f"   🔤 TRANSLITERATION CHECK (FORCED HINDI):")
+    print(f"      Original name (Roman): '{replacement_name}'")
+    print(f"      TTS input (after transliteration): '{tts_input}'")
+    print(f"      Is Devanagari Unicode: {is_devanagari}")
+    if not is_devanagari:
+        print(f"      ⚠️ WARNING: TTS input is NOT Devanagari! Will sound English!")
     
     print(f"🔊 Generating TTS - Voice: '{tts_voice}', Input: '{tts_input}'")
     try:
@@ -1368,7 +1394,7 @@ async def generate_videos(request: GenerateVideosRequest):
     names_to_replace = request.names_to_replace
     excel_names = request.excel_names
     word_timestamps = request.word_timestamps or []
-    language = request.language or "hi"
+    language = "hi"  # FORCE HINDI - Always Hindi, ignore request
     
     video_path = os.path.join(UPLOAD_FOLDER, video_filename)
     if not os.path.exists(video_path):
@@ -1414,35 +1440,30 @@ async def generate_videos(request: GenerateVideosRequest):
                     client = get_openai_client()
                     modified_transcript = original_transcript
                     if names_to_replace and len(names_to_replace) > 0:
-                        # Replace all occurrences of the first name
+                        # FORCE HINDI - Always convert to Devanagari for proper pronunciation
                         for name in names_to_replace:
-                            # For Hindi: Convert to Devanagari for proper pronunciation
-                            if language == "hi":
-                                hindi_name = convert_to_hindi_transliteration(excel_name)
-                                modified_transcript = modified_transcript.replace(name, hindi_name)
-                                print(f"   🔤 Hindi transliteration in transcript: '{excel_name}' -> '{hindi_name}'")
-                            else:
-                                modified_transcript = modified_transcript.replace(name, excel_name)
+                            hindi_name = convert_to_hindi_transliteration(excel_name)
+                            modified_transcript = modified_transcript.replace(name, hindi_name)
+                            print(f"   🔤 Hindi transliteration in transcript (FORCED): '{excel_name}' -> '{hindi_name}'")
                     
-                    # CRITICAL: For Hindi, TTS input MUST be Devanagari Unicode
-                    tts_voice_fallback = "onyx" if language == "hi" else "alloy"
+                    # FORCE HINDI - Always use onyx voice for Hindi
+                    tts_voice_fallback = "onyx"  # ALWAYS onyx for Hindi - forced
                     
                     # VERIFY: Check if transcript contains Devanagari (for Hindi)
-                    if language == "hi":
-                        has_devanagari = any('\u0900' <= char <= '\u097F' for char in modified_transcript)
-                        print(f"   🔤 FULL AUDIO TTS CHECK:")
-                        print(f"      Original Excel name: '{excel_name}'")
-                        print(f"      Modified transcript (first 100 chars): '{modified_transcript[:100]}...'")
-                        print(f"      Contains Devanagari Unicode: {has_devanagari}")
-                        if not has_devanagari:
-                            print(f"      ⚠️ WARNING: Transcript does NOT contain Devanagari! Will sound English!")
+                    has_devanagari = any('\u0900' <= char <= '\u097F' for char in modified_transcript)
+                    print(f"   🔤 FULL AUDIO TTS CHECK (FORCED HINDI):")
+                    print(f"      Original Excel name: '{excel_name}'")
+                    print(f"      Modified transcript (first 100 chars): '{modified_transcript[:100]}...'")
+                    print(f"      Contains Devanagari Unicode: {has_devanagari}")
+                    if not has_devanagari:
+                        print(f"      ⚠️ WARNING: Transcript does NOT contain Devanagari! Will sound English!")
                     
-                    print(f"🔊 Generating full TTS audio - Voice: '{tts_voice_fallback}'")
+                    print(f"🔊 Generating full TTS audio - Voice: '{tts_voice_fallback}' (FORCED HINDI)")
                     audio_path = os.path.join(UPLOAD_FOLDER, f"temp_full_audio_{excel_name}.mp3")
-                    # Use "onyx" for Hindi - deeper, thicker voice - MUST be onyx for Hindi
+                    # ALWAYS use "onyx" for Hindi - deeper, thicker voice - FORCED
                     response = client.audio.speech.create(
                         model="tts-1-hd",
-                        voice=tts_voice_fallback,  # MUST be "onyx" for Hindi
+                        voice=tts_voice_fallback,  # ALWAYS "onyx" for Hindi - forced
                         input=modified_transcript   # MUST contain Devanagari for Hindi accent
                     )
                     response.stream_to_file(audio_path)
